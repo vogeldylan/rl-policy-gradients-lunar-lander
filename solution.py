@@ -11,6 +11,8 @@ from torch.optim import Adam
 import torch.nn as nn
 from torch.distributions.categorical import Categorical
 
+PHI_TYPES = ['reward-to-go', 'generalized-advantage-estimate']
+
 def discount_cumsum(x, discount):
     """
     Compute  cumulative sums of vectors.
@@ -98,14 +100,19 @@ class MLPActorCritic(nn.Module):
         Take a state and return an action, value function, and log-likelihood
         of chosen action.
         """
-        # TODO1: Implement this function.
-        # It is supposed to return three numbers:
-        #    1. An action sampled from the policy given a state (0, 1, 2 or 3)
-        #    2. The value function at the given state
-        #    3. The log-probability of the action under the policy output distribution
-        # Hint: This function is only called when interacting with the environment. You should use
-        # `torch.no_grad` to ensure that it does not interfere with the gradient computation.
-        return 0, 0, 0
+
+        with torch.no_grad():
+            # sample an action
+            pi = self.pi._distribution(state)
+            act = pi.sample()
+
+            # sample the value function
+            value = self.v.forward(state)
+
+            # get the log-prob of the action under the distribution
+            logp_act = self.pi._log_prob_from_distribution(pi, act)
+
+        return int(act), float(value), float(logp_act)
 
 
 class VPGBuffer:
@@ -152,19 +159,13 @@ class VPGBuffer:
         rews = np.append(self.rew_buf[path_slice], last_val)
         vals = np.append(self.val_buf[path_slice], last_val)
 
-        # TODO6: Implement computation of phi.
-        
-        # Hint: For estimating the advantage function to use as phi, equation 
-        # 16 in the GAE paper (see task description) will be helpful, and so will
-        # the discout_cumsum function at the top of this file. 
-        
-        # deltas = rews[:-1] + ...
-        # self.phi_buf[path_slice] =
+        # compute temporal difference residuals of the value function
+        deltas = rews[:-1] + self.gamma * vals[1:] - vals[0:-1]
+        # compute phi as per Eq. 16 of Schulman et al. (2018)
+        self.phi_buf[path_slice] = discount_cumsum(deltas, self.gamma * self.lam)
 
-        #TODO4: currently the return is the total discounted reward for the whole episode. 
-        # Replace this by computing the reward-to-go for each timepoint.
-        # Hint: use the discount_cumsum function.
-        self.ret_buf[path_slice] = discount_cumsum(rews, self.gamma)[0] * np.ones(self.ptr-self.path_start_idx)
+        # calculated the discounted reward-to-go
+        self.ret_buf[path_slice] = discount_cumsum(rews, self.gamma)[0:-1]
 
         self.path_start_idx = self.ptr
 
@@ -177,8 +178,8 @@ class VPGBuffer:
         assert self.ptr == self.max_size
         self.ptr, self.path_start_idx = 0, 0
 
-        # TODO7: Here it may help to normalize the values in self.phi_buf
-        self.phi_buf = self.phi_buf
+        # normalize the phi values to zero mean and unit variance
+        self.phi_buf = (self.phi_buf - self.phi_buf.mean()) / self.phi_buf.std()
 
         data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
                     phi=self.phi_buf, logp=self.logp_buf)
@@ -193,6 +194,10 @@ class Agent:
         # initialises an actor critic
         self.ac = MLPActorCritic(hidden_sizes=[self.hid]*self.l)
 
+        # use generalized advantage estimate for the policy gradient update weighting
+        self.phi_type = PHI_TYPES[1]
+        print(f'Using phi method: {self.phi_type}')
+
         # Learning rates for policy and value function
         pi_lr = 3e-3
         vf_lr = 1e-3
@@ -205,19 +210,27 @@ class Agent:
         """
         Use the data from the buffer to update the policy. Returns nothing.
         """
-        #TODO2: Implement this function. 
-        #TODO8: Change the update rule to make use of the baseline instead of rewards-to-go.
-
         obs = data['obs']
         act = data['act']
         phi = data['phi']
         ret = data['ret']
 
-        # Before doing any computation, always call.zero_grad on the relevant optimizer
+        # reset gradients
         self.pi_optimizer.zero_grad()
 
-        #Hint: you need to compute a 'loss' such that its derivative with respect to the policy
-        #parameters is the policy gradient. Then call loss.backwards() and pi_optimizer.step()
+        # get the log-prob of the policy for this episode
+        logp_pi = self.ac.pi.forward(obs, act)[1]
+
+        if self.phi_type == 'reward-to-go':
+            # compute the loss by multiplying with the reward-to-go of each timestep
+            loss = - (logp_pi * ret).sum()
+        elif self.phi_type == 'generalized-advantage-estimate':
+            # compute loss by multiplying with generalized advantage estimate of each timestep
+            loss = - (logp_pi * phi).sum()
+
+        # backwards step
+        loss.backward()
+        self.pi_optimizer.step()
 
         return
 
@@ -225,19 +238,36 @@ class Agent:
         """
         Use the data from the buffer to update the value function. Returns nothing.
         """
-        #TODO5: Implement this function
+
+        # number of value function updates to perform per epoch
+        N_UPDATES = 100
 
         obs = data['obs']
         act = data['act']
         phi = data['phi']
         ret = data['ret']
 
-        # Hint: it often works well to do multiple rounds of value function updates per epoch.
-        # With the learning rate given, we'd recommend 100. 
-        # In each update, compute a loss for the value function, call loss.backwards() and 
-        # then v_optimizer.step()
-        # Before doing any computation, always call.zero_grad on the relevant optimizer
-        self.v_optimizer.zero_grad()
+        # size of each batch of data
+        slice_size = int(len(obs) / N_UPDATES)
+
+        # warn if data is lost
+        if len(obs) % N_UPDATES:
+            print(f'Warning: {len(obs)} were given, which does not cleanly divide into {N_UPDATES} updates. Some will be lost')
+
+        for ind in range(N_UPDATES):
+            self.v_optimizer.zero_grad()
+
+            # create a new slice for this set of data
+            data_slice = slice(ind*slice_size, (ind+1)*slice_size)
+
+            # calculate the loss function
+            # Note: here we know the exact future discounted return obtained for this slice,
+            # so we can use that to create the squared error term
+            loss = torch.square(self.ac.v.forward(obs[data_slice]) - ret[data_slice]).sum()
+
+            # backwards pass
+            loss.backward()
+            self.v_optimizer.step()
 
         return
 
@@ -330,9 +360,9 @@ class Agent:
         It is not used in your own training code. Instead the .step function in 
         MLPActorCritic is used since it also outputs relevant side-information. 
         """
-        # TODO3: Implement this function.
-        # Currently, this just returns a random action.
-        return np.random.choice([0, 1, 2, 3])
+        # return the action which maximizes the probability under the policy
+        pi = self.ac.pi._distribution(torch.as_tensor(obs, dtype=torch.float32))
+        return(int(pi.probs.argmax()))
 
 
 def main():
